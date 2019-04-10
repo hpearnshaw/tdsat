@@ -32,6 +32,7 @@ def sim_galaxy(patch_size,pixel_size,gal_type=None,gal_params=None):
         
         Optional inputs:
         gal_type = String that loads a pre-built 'average' galaxy or allows custom definition
+        gal_params = Dictionary of parameters for Sersic model: ...
     '''
     from astropy.modeling.models import Sersic2D
     
@@ -70,8 +71,8 @@ def sim_galaxy(patch_size,pixel_size,gal_type=None,gal_params=None):
     
     return gal / ur.s
 
-def construct_image(frame,pixel_size,exposure,psf_fwhm,read_noise,\
-                    gal_type=None,gal_params=None,source=None,sky_rate=None):
+def construct_image(frame,pixel_size,exposure,psf_fwhm,read_noise,oversample=6,psf=None,\
+                    gal_type=None,gal_params=None,source=None,sky_rate=None,n_exp=1):
     '''
         Return a simulated image with a background galaxy (optional), source (optional), and noise
         
@@ -79,21 +80,22 @@ def construct_image(frame,pixel_size,exposure,psf_fwhm,read_noise,\
         frame = Pixel dimensions of simulated image (30,30)
         pixel_size = Angular size of pixel (6 * ur.arcsec)
         exposure = Integration time of the frame (300 * ur.s)
+        psf_fwhm = FWHM in arcsec (4 * ur.arcsec)
+        read_noise = Read noise in photons / pixel (unitless float)
         
         Optional inputs:
-        galaxy = None OR default galaxy string ("spiral"/"elliptical") OR "custom" w/ galaxy params in kwargs
-        source = None OR source photon count rate (100 / ur.s)
-        
-        To add:
-        psf - make this an input itself, default to Gaussian w/ psf_fwhm. Work with oversampling
-        num_exp - generate an array of exposures, all the same except different Poisson noise
+        oversample = How much to oversample image by when constructing. Must be consistent with psf.
+        psf = 2D array containing PSF normalised to 1
+        gal_type = Default galaxy string ("spiral"/"elliptical") or "custom" w/ Sersic parameters in gal_params
+        gal_params = Dictionary of parameters for Sersic model (see sim_galaxy)
+        source = Source photon count rate (100 / ur.s)
+        n_exp = Number of exposures to be co-added
     '''
-    
-    oversample = 6 # ~1 arcsec resolution for initial image generation
-    
-    # Make an oversampled PSF here
     pixel_size_init = pixel_size / oversample
-    psf = gaussian_psf(psf_fwhm,(15,15),pixel_size_init)
+    
+    # Make an oversampled PSF if one is not already given
+    if psf is None:
+        psf = gaussian_psf(psf_fwhm,(15,15),pixel_size_init)
     
     # Initialise an image, oversampled by the oversample parameter to begin with
     im_array = np.zeros(frame * oversample) / ur.s
@@ -111,6 +113,8 @@ def construct_image(frame,pixel_size,exposure,psf_fwhm,read_noise,\
     
     # Convolve with the PSF (need to re-apply units here as it's lost in convolution)
     im_psf = convolve2d(im_array,psf,mode='same') / ur.s
+
+    # Apply jitter at this stage? Shuffle everything around by a pixel or something
     
     # Bin up the image by oversample parameter to the correct pixel size
     shape = (frame[0], oversample, frame[1], oversample)
@@ -124,25 +128,39 @@ def construct_image(frame,pixel_size,exposure,psf_fwhm,read_noise,\
     # Convert to counts
     im_counts = im_binned * exposure
 
-    # Apply Poisson noise and instrument noise
-    im_noise = np.random.poisson(im_counts) + np.random.normal(loc=0,scale=read_noise,size=im_counts.shape)
-    im_final = np.floor(im_noise)
-    im_final[im_final < 0] = 0
+    # Co-add a number of separate exposures
+    im_final = np.zeros(frame)
+    for i in range(n_exp):
+        # Apply Poisson noise and instrument noise
+        im_noise = np.random.poisson(im_counts) + np.random.normal(loc=0,scale=read_noise,size=im_counts.shape)
+        im_noise = np.floor(im_noise)
+        im_noise[im_noise < 0] = 0
+
+        # Add to the co-add
+        im_final += im_noise
     
-    # Return image
+    # Return image 
     return im_final
 
 
-def find(image,fwhm):
+def find(image,fwhm,method='daophot'):
     '''
         Find all stars above the sky background level using DAOFind-like algorithm
+        
+        Required inputs:
+        image = 2D array of image on which to perform find
+        fwhm = FWHM in pixels (1)
+        
+        Optional inputs:
+        method = Either 'daophot' or 'peaks' to select different finding algorithms
     '''
-    from photutils import Background2D
-    from photutils.detection import DAOStarFinder
+    from photutils import Background2D, MedianBackground
+    from photutils.detection import DAOStarFinder, find_peaks
     
     # Create a background image
     bkg_estimator = MedianBackground()
-    bkg = Background2D(image, (50, 50), filter_size=(5,5), bkg_estimator=bkg_estimator)
+    bkg = Background2D(image, (image.shape[0] // 10, image.shape[1] // 10), \
+                       filter_size=(3,3), bkg_estimator=bkg_estimator)
     sky = bkg.background_rms_median
     bkg_image = bkg.background
     print("Sky background rms: {}".format(sky))
@@ -151,25 +169,71 @@ def find(image,fwhm):
     threshold = 5 * sky
     
     # Find stars
-    finder = DAOStarFinder(threshold,fwhm)
-    star_tbl = finder.find_stars(image)
+    if method == 'daophot':
+        finder = DAOStarFinder(threshold,fwhm)
+        star_tbl = finder.find_stars(image)
+        star_tbl['x'], star_tbl['y'] = star_tbl['xcentroid'], star_tbl['ycentroid']
+    elif method == 'peaks':
+        star_tbl = find_peaks(image-bkg_image,threshold,box_size=3)
+        star_tbl['x'], star_tbl['y'] = star_tbl['x_peak'], star_tbl['y_peak']
+
     print("Found {} stars".format(len(star_tbl)))
     
     return star_tbl, bkg_image, threshold
 
-def run_daophot(image,psf,threshold,fwhm,star_tbl,niters):
+def ap_phot(image,star_tbl,r=1.5,r_in=1.5,r_out=3.):
+    '''
+        Given an image, go do some aperture photometry
+    '''
+    from astropy.stats import sigma_clipped_stats
+    from photutils import aperture_photometry, CircularAperture, CircularAnnulus
+
+    # Build apertures from star_tbl
+    positions = np.transpose([star_tbl['x'],star_tbl['y']])
+    apertures = CircularAperture(positions, r=r)
+    annulus_apertures = CircularAnnulus(positions, r_in=r_in, r_out=r_out)
+    annulus_masks = annulus_apertures.to_mask(method='center')
+
+    # Get backgrounds in annuli
+    bkg_median = []
+    for mask in annulus_masks:
+        annulus_data = mask.multiply(image)
+        annulus_data_1d = annulus_data[mask.data > 0]
+        _, median_sigclip, _ = sigma_clipped_stats(annulus_data_1d)
+        bkg_median.append(median_sigclip)
+    bkg_median = np.array(bkg_median)
+
+    # Perform aperture photometry
+    result = aperture_photometry(image, apertures)
+    result['annulus_median'] = bkg_median
+    result['aper_bkg'] = bkg_median * apertures.area()
+    result['aper_sum_bkgsub'] = result['aperture_sum'] - result['aper_bkg']
+
+    # To-do: get errors
+
+    for col in result.colnames:
+            result[col].info.format = '%.8g'  # for consistent table output
+    print("Aperture photometry complete")
+
+    return result, apertures, annulus_apertures
+
+def run_daophot(image,threshold,fwhm,star_tbl,niters=1):
     '''
         Given an image and a PSF, go run DAOPhot PSF-fitting algorithm
     '''
-    from photutils.psf import DAOPhotPSFPhotometry
+    from photutils.psf import DAOPhotPSFPhotometry, IntegratedGaussianPRF
     
     # Fix star table columns
-    star_tbl['x_0'] = star_tbl['xcentroid']
-    star_tbl['y_0'] = star_tbl['ycentroid']
+    star_tbl['x_0'] = star_tbl['x']
+    star_tbl['y_0'] = star_tbl['y']
+    
+    # Define a fittable PSF model
+    sigma = fwhm / (2. * np.sqrt(2 * np.log(2)))
+    psf_model = IntegratedGaussianPRF(sigma=sigma)
     
     # Initialise a Photometry object
     # This object loops find, fit and subtract
-    photometry = DAOPhotPSFPhotometry(2.*fwhm,threshold,fwhm,psf,(3,3),niters=niters,aperture_radius=fwhm)
+    photometry = DAOPhotPSFPhotometry(3.*fwhm,threshold,fwhm,psf_model,(5,5),niters=niters,sigma_radius=5)
     
     # Problem with _recursive_lookup while fitting (needs latest version of astropy fix to modeling/utils.py)
     result = photometry(image=image, init_guesses=star_tbl)
