@@ -10,7 +10,7 @@ def gaussian_psf(fwhm,patch_size,pixel_size):
     
     Required inputs:
     fwhm = FWHM in arcsec (4 * ur.arcsec)
-    patch_size = Axis sizes of returned galaxy patch in pixels (15,15)
+    patch_size = Axis sizes of returned PSF patch in pixels (15,15)
     pixel_size = Angular size of pixel (6 * ur.arcsec)
     '''
     x = np.linspace(-(patch_size[0] // 2), patch_size[0] // 2, patch_size[0])
@@ -20,6 +20,12 @@ def gaussian_psf(fwhm,patch_size,pixel_size):
     sigma_pix = fwhm / (2. * np.sqrt(2 * np.log(2)) * pixel_size)
     psf = np.exp(-(x**2 + y**2) / (2 * sigma_pix**2)) / (2 * np.pi * sigma_pix**2)
 
+    return psf
+
+def duet_psf():
+    '''
+        To-do
+    '''
     return psf
 
 def sim_galaxy(patch_size,pixel_size,gal_type=None,gal_params=None):
@@ -35,35 +41,48 @@ def sim_galaxy(patch_size,pixel_size,gal_type=None,gal_params=None):
         gal_params = Dictionary of parameters for Sersic model: ...
     '''
     from astropy.modeling.models import Sersic2D
+    from bbmag import bb_abmag_fluence
+    from tdsat_telescope import load_telescope_parameters
     
     x = np.linspace(-(patch_size[0] // 2), patch_size[0] // 2, patch_size[0])
     y = np.linspace(-(patch_size[1] // 2), patch_size[1] // 2, patch_size[1])
     x, y = np.meshgrid(x,y)
     
     # Takes either a keyword or Sersic profile parameters
-    # Parameters currently meaningless
+    # Typical galaxy parameters based on Bai et al. (2013)
     if gal_type == 'spiral':
-        amplitude = 0.1 # Surface brightness at r_eff in count rate
-        r_eff = 20
+        # A typical spiral galaxy at 100 Mpc
+        amplitude = 0.006 # Hardcoded in for now - will make dependent on telescope parameters etc. later
+        r_eff = 16.5 / pixel_size.value
         n = 1
         theta = 0
         ellip = 0.5
-        x_0, y_0 = 20, 0
+        x_0, y_0 = r_eff, 0
     elif gal_type == 'elliptical':
-        amplitude = 0.1
-        r_eff = 20
-        n = 3
+        # A typical elliptical galaxy at 100 Mpc
+        amplitude = 0.02
+        r_eff = 12.5 / pixel_size.value
+        n = 4
         theta = 0
         ellip = 0.5
-        x_0, y_0 = 20, 0
+        x_0, y_0 = r_eff, 0
+    elif gal_type == 'dwarf':
+        # A typical dwarf galaxy at 10 Mpc
+        amplitude = 0.009
+        r_eff = 70 / pixel_size
+        r_eff = r_eff.value
+        n = 4
+        theta = 0
+        ellip = 0.5
+        x_0, y_0 = r_eff, 0
     elif (gal_type == 'custom') | (gal_type == None):
-        # Get args from kwargs
-        amplitude = gal_params.get('amplitude', 0.1)
-        r_eff = gal_params.get('r_eff', 20)
+        # Get args from gal_params
+        amplitude = gal_params.get('amplitude', 0.006)
+        r_eff = gal_params.get('r_eff', 16.5 / pixel_size.value)
         n = gal_params.get('n', 1)
         theta = gal_params.get('theta', 0)
         ellip = gal_params.get('ellip', 0.5)
-        x_0 = gal_params.get('x_0', 20)
+        x_0 = gal_params.get('x_0', 16.5 / pixel_size.value)
         y_0 = gal_params.get('y_0', 0)
     
     mod = Sersic2D(amplitude=amplitude, r_eff=r_eff, n=n, x_0=x_0, y_0=y_0, ellip=ellip, theta=theta)
@@ -181,12 +200,13 @@ def find(image,fwhm,method='daophot'):
     
     return star_tbl, bkg_image, threshold
 
-def ap_phot(image,star_tbl,r=1.5,r_in=1.5,r_out=3.):
+def ap_phot(image,star_tbl,read_noise,exposure,r=1.5,r_in=1.5,r_out=3.):
     '''
         Given an image, go do some aperture photometry
     '''
     from astropy.stats import sigma_clipped_stats
     from photutils import aperture_photometry, CircularAperture, CircularAnnulus
+    from photutils.utils import calc_total_error
 
     # Build apertures from star_tbl
     positions = np.transpose([star_tbl['x'],star_tbl['y']])
@@ -203,13 +223,16 @@ def ap_phot(image,star_tbl,r=1.5,r_in=1.5,r_out=3.):
         bkg_median.append(median_sigclip)
     bkg_median = np.array(bkg_median)
 
+    # Set error
+    error = calc_total_error(image, read_noise / exposure, exposure)
+
     # Perform aperture photometry
-    result = aperture_photometry(image, apertures)
+    result = aperture_photometry(image, apertures, error=error)
     result['annulus_median'] = bkg_median
     result['aper_bkg'] = bkg_median * apertures.area()
     result['aper_sum_bkgsub'] = result['aperture_sum'] - result['aper_bkg']
 
-    # To-do: get errors
+    # To-do: fold an error on background level into the aperture photometry error
 
     for col in result.colnames:
             result[col].info.format = '%.8g'  # for consistent table output
